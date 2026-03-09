@@ -17,7 +17,6 @@ mod mcxa2xx_exclusive {
     pub mod clkout;
     pub mod flash;
     pub mod i3c;
-    pub mod lpuart;
     pub mod rtc;
     pub mod spi;
 
@@ -45,6 +44,7 @@ mod all_chips {
     pub mod gpio;
     pub mod i2c;
     pub mod inputmux;
+    pub mod lpuart;
     pub mod ostimer;
     pub mod perf_counters;
     pub mod reset_reason;
