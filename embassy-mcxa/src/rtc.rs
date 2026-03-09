@@ -1,4 +1,7 @@
 //! RTC DateTime driver.
+//!
+//! Supports both MCXA2xx (Unix timestamp-based) and MCXA5xx (BCD calendar-based)
+//! RTC peripherals behind a unified API.
 use core::marker::PhantomData;
 
 use embassy_hal_internal::{Peri, PeripheralType};
@@ -7,7 +10,7 @@ use maitake_sync::WaitCell;
 use crate::clocks::{WakeGuard, with_clocks};
 use crate::interrupt::typelevel::{Handler, Interrupt};
 use crate::pac;
-use crate::pac::rtc::vals::{Swr, Tcr, Um};
+use crate::pac::rtc::vals::Swr;
 
 /// RTC interrupt handler.
 pub struct InterruptHandler<I: Instance> {
@@ -74,8 +77,11 @@ const SECONDS_IN_A_DAY: u32 = 86400;
 const SECONDS_IN_A_HOUR: u32 = 3600;
 /// Number of seconds in a minute
 const SECONDS_IN_A_MINUTE: u32 = 60;
-/// Unix epoch start year
+/// Unix epoch start year (MCXA2xx)
 const YEAR_RANGE_START: u16 = 1970;
+/// IRTC base year (MCXA5xx) — YROFST is a signed 8-bit offset from this
+#[cfg(feature = "mcxa5xx")]
+const IRTC_BASE_YEAR: i16 = 2112;
 
 /// Date and time structure for RTC operations
 #[derive(Debug, Clone, Copy)]
@@ -87,6 +93,10 @@ pub struct RtcDateTime {
     pub minute: u8,
     pub second: u8,
 }
+#[cfg(feature = "mcxa2xx")]
+use crate::pac::rtc::vals::{Tcr, Um};
+
+#[cfg(feature = "mcxa2xx")]
 #[derive(Copy, Clone)]
 pub struct RtcConfig {
     #[allow(dead_code)]
@@ -98,14 +108,63 @@ pub struct RtcConfig {
     compensation_time: Tcr,
 }
 
+#[cfg(feature = "mcxa2xx")]
 /// RTC interrupt enable flags
 #[derive(Copy, Clone)]
 pub struct RtcInterruptEnable;
+#[cfg(feature = "mcxa2xx")]
 impl RtcInterruptEnable {
     pub const RTC_TIME_INVALID_INTERRUPT_ENABLE: u32 = 1 << 0;
     pub const RTC_TIME_OVERFLOW_INTERRUPT_ENABLE: u32 = 1 << 1;
     pub const RTC_ALARM_INTERRUPT_ENABLE: u32 = 1 << 2;
     pub const RTC_SECONDS_INTERRUPT_ENABLE: u32 = 1 << 4;
+}
+
+#[cfg(feature = "mcxa5xx")]
+use crate::pac::rtc::vals::AlmMatch;
+
+/// RTC configuration for MCXA5xx
+#[cfg(feature = "mcxa5xx")]
+#[derive(Copy, Clone)]
+pub struct RtcConfig {
+    /// Alarm match granularity (default: match up to year for exact alarm)
+    pub alarm_match: AlmMatch,
+}
+
+/// Unlock IRTC write protection by writing the magic sequence to STATUS[7:0].
+///
+/// The IRTC requires 8-bit writes of 0x00, 0x40, 0xC0, 0x80 to the low byte
+/// of the STATUS register before any register writes are accepted.
+#[cfg(feature = "mcxa5xx")]
+fn irtc_unlock_write_protect(regs: pac::rtc::Rtc) {
+    let status_addr = regs.status().as_ptr() as *mut u8;
+    unsafe {
+        core::ptr::write_volatile(status_addr, 0x00);
+        core::ptr::write_volatile(status_addr, 0x40);
+        core::ptr::write_volatile(status_addr, 0xC0);
+        core::ptr::write_volatile(status_addr, 0x80);
+    }
+}
+
+/// Lock IRTC write protection.
+#[cfg(feature = "mcxa5xx")]
+fn irtc_lock_write_protect(regs: pac::rtc::Rtc) {
+    let status_addr = regs.status().as_ptr() as *mut u8;
+    unsafe {
+        core::ptr::write_volatile(status_addr, 0x00);
+    }
+}
+
+/// Convert a calendar year to the IRTC YROFST register value (signed 8-bit offset from 2112).
+#[cfg(feature = "mcxa5xx")]
+fn year_to_yrofst(year: u16) -> u8 {
+    ((year as i16 - IRTC_BASE_YEAR) as i8) as u8
+}
+
+/// Convert the IRTC YROFST register value back to a calendar year.
+#[cfg(feature = "mcxa5xx")]
+fn yrofst_to_year(yrofst: u8) -> u16 {
+    (IRTC_BASE_YEAR + (yrofst as i8) as i16) as u16
 }
 
 /// Converts a DateTime structure to Unix timestamp (seconds since 1970-01-01)
@@ -229,6 +288,7 @@ pub fn convert_seconds_to_datetime(seconds: u32) -> RtcDateTime {
 /// - Update mode 0 (immediate updates)
 /// - No supervisor access restriction
 /// - No compensation
+#[cfg(feature = "mcxa2xx")]
 pub fn get_default_config() -> RtcConfig {
     RtcConfig {
         wakeup_select: false,
@@ -238,13 +298,31 @@ pub fn get_default_config() -> RtcConfig {
         compensation_time: Tcr::TCR_0,
     }
 }
+
+/// Returns default RTC configuration
+///
+/// # Returns
+///
+/// RtcConfig with sensible default values (alarm match on full date+time)
+#[cfg(feature = "mcxa5xx")]
+pub fn get_default_config() -> RtcConfig {
+    RtcConfig {
+        alarm_match: AlmMatch::YEAR,
+    }
+}
 /// Minimal RTC handle for a specific instance I (store the zero-sized token like embassy)
 pub struct Rtc<'a> {
     _inst: core::marker::PhantomData<&'a mut ()>,
     info: &'static Info,
     _wg: Option<WakeGuard>,
+    #[cfg(feature = "mcxa5xx")]
+    alarm_match: AlmMatch,
 }
 
+// =============================================================================
+// MCXA2xx implementation — Unix timestamp-based RTC
+// =============================================================================
+#[cfg(feature = "mcxa2xx")]
 impl<'a> Rtc<'a> {
     /// Create a new instance of the real time clock.
     pub fn new<T: Instance>(
@@ -467,6 +545,7 @@ impl<'a> Rtc<'a> {
 /// RTC interrupt handler
 ///
 /// This struct implements the interrupt handler for RTC events.
+#[cfg(feature = "mcxa2xx")]
 impl<T: Instance> Handler<T::Interrupt> for InterruptHandler<T> {
     unsafe fn on_interrupt() {
         T::PERF_INT_INCR();
@@ -475,6 +554,231 @@ impl<T: Instance> Handler<T::Interrupt> for InterruptHandler<T> {
         let sr = rtc.sr().read();
         if sr.taf() {
             rtc.ier().modify(|w| w.set_taie(false));
+            T::PERF_INT_WAKE_INCR();
+            T::info().wait_cell().wake();
+        }
+    }
+}
+
+// =============================================================================
+// MCXA5xx implementation — BCD calendar-based RTC
+// =============================================================================
+#[cfg(feature = "mcxa5xx")]
+impl<'a> Rtc<'a> {
+    /// Create a new instance of the real time clock.
+    pub fn new<T: Instance>(
+        _inst: Peri<'a, T>,
+        _irq: impl crate::interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'a,
+        config: RtcConfig,
+    ) -> Self {
+        let info = T::info();
+
+        let clocks = with_clocks(|c| c.clk_16k_vsys.clone());
+        let clk = match clocks {
+            None => panic!("Clocks have not been initialized"),
+            Some(None) => panic!("Clocks initialized, but clk_16k_vsys not active"),
+            Some(Some(clk)) => clk,
+        };
+
+        // Unlock write protection before any register writes
+        irtc_unlock_write_protect(info.regs());
+
+        // RTC software reset (note: YROFST is unaffected by SWR per ref manual)
+        info.regs().ctrl().modify(|w| w.set_swr(Swr::ASSERTED));
+        info.regs().ctrl().modify(|w| w.set_swr(Swr::CLEARED));
+
+        // Configure alarm match mode
+        info.regs().ctrl().modify(|w| {
+            w.set_alm_match(config.alarm_match);
+        });
+
+        // Initialize to a valid date (2025-01-01 00:00:00)
+        info.regs().yearmon().write(|w| {
+            w.set_yrofst(year_to_yrofst(2025));
+            w.set_mon_cnt(crate::pac::rtc::vals::MonCnt::JANUARY);
+        });
+        info.regs().days().write(|w| {
+            w.set_day_cnt(1);
+        });
+        info.regs().hourmin().write(|w| {
+            w.set_hour_cnt(0);
+            w.set_min_cnt(0);
+        });
+        info.regs().seconds().write(|w| {
+            w.set_sec_cnt(0);
+        });
+
+        // Re-lock write protection
+        irtc_lock_write_protect(info.regs());
+
+        // Enable RTC interrupt
+        T::Interrupt::unpend();
+        unsafe { T::Interrupt::enable() };
+
+        Self {
+            _inst: core::marker::PhantomData,
+            info,
+            _wg: WakeGuard::for_power(&clk.power),
+            alarm_match: config.alarm_match,
+        }
+    }
+
+    /// Set the current date and time
+    ///
+    /// Writes directly to the BCD calendar registers.
+    pub fn set_datetime(&self, datetime: RtcDateTime) {
+        let r = self.info.regs();
+
+        irtc_unlock_write_protect(r);
+
+        r.yearmon().write(|w| {
+            w.set_yrofst(year_to_yrofst(datetime.year));
+            w.set_mon_cnt(crate::pac::rtc::vals::MonCnt::from_bits(datetime.month));
+        });
+        r.days().write(|w| {
+            w.set_day_cnt(datetime.day);
+        });
+        r.hourmin().write(|w| {
+            w.set_hour_cnt(datetime.hour);
+            w.set_min_cnt(datetime.minute);
+        });
+        r.seconds().write(|w| {
+            w.set_sec_cnt(datetime.second);
+        });
+
+        irtc_lock_write_protect(r);
+    }
+
+    /// Get the current date and time
+    ///
+    /// Reads from the BCD calendar registers.
+    pub fn get_datetime(&self) -> RtcDateTime {
+        let r = self.info.regs();
+
+        let ym = r.yearmon().read();
+        let d = r.days().read();
+        let hm = r.hourmin().read();
+        let s = r.seconds().read();
+
+        RtcDateTime {
+            year: yrofst_to_year(ym.yrofst()),
+            month: ym.mon_cnt().to_bits(),
+            day: d.day_cnt(),
+            hour: hm.hour_cnt(),
+            minute: hm.min_cnt(),
+            second: s.sec_cnt(),
+        }
+    }
+
+    /// Set the alarm date and time
+    ///
+    /// Writes to the alarm calendar registers and enables the alarm interrupt.
+    pub fn set_alarm(&self, alarm: RtcDateTime) {
+        let r = self.info.regs();
+
+        irtc_unlock_write_protect(r);
+
+        // Clear any pending alarm interrupt (W1C)
+        r.isr().modify(|w| w.set_alm_is(true));
+
+        r.alm_yearmon().write(|w| {
+            w.set_alm_year(year_to_yrofst(alarm.year));
+            w.set_alm_mon(alarm.month);
+        });
+        r.alm_days().write(|w| {
+            w.set_alm_day(alarm.day);
+        });
+        r.alm_hourmin().write(|w| {
+            w.set_alm_hour(alarm.hour);
+            w.set_alm_min(alarm.minute);
+        });
+        r.alm_seconds().write(|w| {
+            w.set_alm_sec(alarm.second);
+        });
+
+        r.ctrl().modify(|w| w.set_alm_match(self.alarm_match));
+        r.ier().modify(|w| w.set_alm_ie(true));
+
+        irtc_lock_write_protect(r);
+    }
+
+    /// Get the current alarm date and time
+    pub fn get_alarm(&self) -> RtcDateTime {
+        let r = self.info.regs();
+
+        let ym = r.alm_yearmon().read();
+        let d = r.alm_days().read();
+        let hm = r.alm_hourmin().read();
+        let s = r.alm_seconds().read();
+
+        RtcDateTime {
+            year: yrofst_to_year(ym.alm_year()),
+            month: ym.alm_mon(),
+            day: d.alm_day(),
+            hour: hm.alm_hour(),
+            minute: hm.alm_min(),
+            second: s.alm_sec(),
+        }
+    }
+
+    /// Start the RTC time counter
+    ///
+    /// The MCXA5xx RTC runs automatically after reset — this is provided for API compatibility.
+    pub fn start(&self) {
+        // MCXA5xx RTC has no explicit counter enable bit — it runs once SWR is deasserted.
+    }
+
+    /// Stop the RTC time counter
+    ///
+    /// The MCXA5xx RTC cannot be paused without a destructive software reset that clears
+    /// all registers. Calendar registers can be written while the RTC is running, so this
+    /// is a no-op for API compatibility.
+    pub fn stop(&self) {
+        // No-op: SWR would reset all register state, which is not the intended behavior.
+    }
+
+    /// Clear the alarm interrupt flag
+    pub fn clear_alarm_flag(&self) {
+        let r = self.info.regs();
+        irtc_unlock_write_protect(r);
+        // W1C: write 1 to clear
+        r.isr().modify(|w| w.set_alm_is(true));
+        r.ier().modify(|w| w.set_alm_ie(false));
+        irtc_lock_write_protect(r);
+    }
+
+    /// Wait for an RTC alarm to trigger.
+    ///
+    /// # Arguments
+    ///
+    /// * `alarm` - The date and time when the alarm should trigger
+    ///
+    /// This function will wait until the RTC alarm is triggered.
+    pub async fn wait_for_alarm(&mut self, alarm: RtcDateTime) {
+        let wait = self.info.wait_cell().subscribe().await;
+
+        self.set_alarm(alarm);
+
+        // REVISIT: propagate error?
+        let _ = wait.await;
+
+        // Clear and disable the alarm after waking up
+        self.clear_alarm_flag();
+    }
+}
+
+/// MCXA5xx RTC interrupt handler — checks alarm interrupt status in ISR
+#[cfg(feature = "mcxa5xx")]
+impl<T: Instance> Handler<T::Interrupt> for InterruptHandler<T> {
+    unsafe fn on_interrupt() {
+        T::PERF_INT_INCR();
+        let rtc = pac::RTC0;
+        let isr = rtc.isr().read();
+        if isr.alm_is() {
+            // W1C: write 1 to clear the alarm status
+            rtc.isr().modify(|w| w.set_alm_is(true));
+            // Disable alarm interrupt to prevent re-entry
+            rtc.ier().modify(|w| w.set_alm_ie(false));
             T::PERF_INT_WAKE_INCR();
             T::info().wait_cell().wake();
         }

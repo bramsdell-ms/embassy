@@ -292,7 +292,7 @@ mod inner_periph {
         PORT4,
         PORT5,
 
-        // RTC0,
+        RTC0,
         // SAU,
         // SCG0,
         // SCN_SCB,
@@ -411,7 +411,7 @@ mod inner_interrupt {
         // MBC0,
         OS_EVENT,
         // PKC,
-        // RTC,
+        RTC,
         // RTC_1HZ,
         // SCG0,
         // SGI,
@@ -436,7 +436,7 @@ pub fn init(cfg: crate::config::Config) -> Peripherals {
     #[allow(unused_mut)]
     let mut peripherals = Peripherals::take();
 
-    // crate::interrupt::RTC.set_priority(cfg.rtc_interrupt_priority);
+    crate::interrupt::RTC.set_priority(cfg.rtc_interrupt_priority);
     crate::interrupt::GPIO0.set_priority(cfg.gpio_interrupt_priority);
     crate::interrupt::GPIO1.set_priority(cfg.gpio_interrupt_priority);
     crate::interrupt::GPIO2.set_priority(cfg.gpio_interrupt_priority);

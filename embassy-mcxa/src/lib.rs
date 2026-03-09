@@ -18,7 +18,6 @@ mod mcxa2xx_exclusive {
     pub mod flash;
     pub mod i3c;
     pub mod lpuart;
-    pub mod rtc;
     pub mod spi;
 
     pub use crate::chips::mcxa2xx::{Peripherals, init, interrupt, peripherals};
@@ -48,6 +47,7 @@ mod all_chips {
     pub mod ostimer;
     pub mod perf_counters;
     pub mod reset_reason;
+    pub mod rtc;
     pub mod trng;
     pub mod wwdt;
 }
