@@ -155,6 +155,10 @@ mod inner_periph {
         #[cfg(feature = "jtag-extras-as-gpio")]
         P0_6,
         P0_7,
+        P0_8,
+        P0_9,
+        P0_10,
+        P0_11,
         P0_12,
         P0_13,
         P0_14,
@@ -229,6 +233,11 @@ mod inner_periph {
         P2_24,
         P2_25,
         P2_26,
+        P2_27,
+        P2_28,
+        P2_29,
+        P2_30,
+        P2_31,
 
         P3_0,
         P3_1,
@@ -556,6 +565,10 @@ mod gpio_impls {
     #[cfg(feature = "jtag-extras-as-gpio")]
     impl_pin!(P0_6, 0, 6, GPIO0);
     impl_pin!(P0_7, 0, 7, GPIO0);
+    impl_pin!(P0_8, 0, 8, GPIO0);
+    impl_pin!(P0_9, 0, 9, GPIO0);
+    impl_pin!(P0_10, 0, 10, GPIO0);
+    impl_pin!(P0_11, 0, 11, GPIO0);
     impl_pin!(P0_12, 0, 12, GPIO0);
     impl_pin!(P0_13, 0, 13, GPIO0);
     impl_pin!(P0_14, 0, 14, GPIO0);
@@ -627,6 +640,11 @@ mod gpio_impls {
     impl_pin!(P2_24, 2, 24, GPIO2);
     impl_pin!(P2_25, 2, 25, GPIO2);
     impl_pin!(P2_26, 2, 26, GPIO2);
+    impl_pin!(P2_27, 2, 27, GPIO2);
+    impl_pin!(P2_28, 2, 28, GPIO2);
+    impl_pin!(P2_29, 2, 29, GPIO2);
+    impl_pin!(P2_30, 2, 30, GPIO2);
+    impl_pin!(P2_31, 2, 31, GPIO2);
 
     impl_pin!(P3_0, 3, 0, GPIO3);
     impl_pin!(P3_1, 3, 1, GPIO3);
