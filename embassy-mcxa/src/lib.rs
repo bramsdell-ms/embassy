@@ -24,6 +24,8 @@ mod mcxa2xx_exclusive {
 #[cfg(feature = "mcxa5xx")]
 #[path = "."]
 mod mcxa5xx_exclusive {
+    pub mod adc;
+
     pub use crate::chips::mcxa5xx::{Peripherals, init, interrupt, peripherals};
 }
 
