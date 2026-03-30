@@ -846,7 +846,8 @@ impl<'d, M: AsyncMode> I2c<'d, M>
 where
     Self: AsyncEngine,
 {
-    fn enable_ints(&self) {
+    /// Enable only the interrupts relevant to listening for a new address match.
+    fn enable_listen_ints(&self) {
         self.info.regs().sier().write(|w| {
             w.set_sarie(self.smbus_alert.clone().into());
             w.set_gcie(self.general_call.clone().into());
@@ -856,9 +857,28 @@ where
             w.set_beie(true);
             w.set_sdie(true);
             w.set_rsie(true);
-            w.set_taie(true);
             w.set_avie(true);
+        });
+    }
+
+    /// Enable only the interrupts relevant to receiving data (respond_to_write).
+    fn enable_rx_ints(&self) {
+        self.info.regs().sier().write(|w| {
+            w.set_feie(true);
+            w.set_beie(true);
+            w.set_sdie(true);
+            w.set_rsie(true);
             w.set_rdie(true);
+        });
+    }
+
+    /// Enable only the interrupts relevant to transmitting data (respond_to_read).
+    fn enable_tx_ints(&self) {
+        self.info.regs().sier().write(|w| {
+            w.set_feie(true);
+            w.set_beie(true);
+            w.set_sdie(true);
+            w.set_rsie(true);
             w.set_tdie(true);
         });
     }
@@ -876,11 +896,12 @@ where
     /// - `Err(IOError)` if an error occurs.
     pub async fn async_listen(&mut self) -> Result<Request, IOError> {
         self.clear_status();
+        self.reset_fifos();
 
         self.info
             .wait_cell()
             .wait_for(|| {
-                self.enable_ints();
+                self.enable_listen_ints();
                 let status = self.info.regs().ssr().read();
                 status.avf() || status.sarf() || status.gcf() || status.sdf()
             })
@@ -965,7 +986,7 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
             self.info
                 .wait_cell()
                 .wait_for(|| {
-                    self.enable_ints();
+                    self.enable_tx_ints();
                     let ssr = self.info.regs().ssr().read();
                     ssr.tdf() || ssr.sdf() || ssr.rsf()
                 })
@@ -997,7 +1018,7 @@ impl<'d> AsyncEngine for I2c<'d, Async> {
             self.info
                 .wait_cell()
                 .wait_for(|| {
-                    self.enable_ints();
+                    self.enable_rx_ints();
                     let ssr = self.info.regs().ssr().read();
                     ssr.rdf() || ssr.sdf() || ssr.rsf()
                 })
