@@ -907,6 +907,147 @@ impl<'d> I3c<'d> {
         }
     }
 
+    /// Pre-stage a controller-initiated read response **before** the read's
+    /// address-match window, without raising an IBI.
+    ///
+    /// I3C forbids clock stretching, so a secondary target cannot hold the
+    /// controller off to fetch read data on demand: by the time the reactive
+    /// [`Self::dma_respond_to_read`] path runs (dispatched from the
+    /// [`Event::TxPending`] that follows the read address-match) the
+    /// controller is already clocking SCL and the TX FIFO underruns before
+    /// software can load the first byte (`SERRWARN.URUNNACK`). For a target
+    /// whose response is knowable ahead of the read — e.g. a register-map
+    /// device that serves `bank[offset..]` — the TX path must be primed while
+    /// the bus is still idle.
+    ///
+    /// Call this once a read is anticipated (typically from the `Stop` of the
+    /// offset-setting write), then finish it with
+    /// [`Self::complete_prearmed_read`] when the [`Event::TxPending`] arrives.
+    /// If a write (or other non-read activity) arrives instead of the expected
+    /// read, discard the staged response with [`Self::abort_prearm`].
+    ///
+    /// Mirrors the pre-load half of [`Self::dma_respond_to_read_with_ibi`]
+    /// minus the IBI: tears down any prior pre-arm, then arms `tx_dma` against
+    /// `SWDATAB1` for `buf[..len-1]`. The DMA immediately tops up the TX FIFO
+    /// (depth 8) at bus idle and streams the remainder as the controller
+    /// drains it. Returns the final byte the caller passes to
+    /// [`Self::complete_prearmed_read`] to emit the SDR end-of-data marker
+    /// (T-bit) via `SWDATABE`, or `None` when `buf` is empty (nothing to
+    /// serve).
+    ///
+    /// The caller may over-stage (offer more bytes than the controller will
+    /// read); [`Self::complete_prearmed_read`] handles the controller
+    /// terminating the read early.
+    pub fn prearm_read(&mut self, buf: &[u8]) -> Result<Option<u8>, IOError> {
+        // Clear any DMA/FIFO state left by an unclaimed previous pre-arm so a
+        // stale response can't be spliced onto this one.
+        self.tx_teardown();
+
+        let Some((last, rest)) = buf.split_last() else {
+            return Ok(None);
+        };
+
+        if !rest.is_empty() {
+            self.dma_tx_arm(rest)?;
+        }
+
+        Ok(Some(*last))
+    }
+
+    /// Complete a read previously staged by [`Self::prearm_read`].
+    ///
+    /// Dispatched from the [`Event::TxPending`] that follows the read
+    /// address-match, by which point the controller is clocking the read and
+    /// draining the pre-loaded TX FIFO. Waits for the pre-armed DMA to finish
+    /// streaming the staged bytes into the FIFO **or** for the controller to
+    /// terminate the read early (`SERRWARN` — expected for a register-map
+    /// read that offers more bytes than the controller takes), tears the DMA
+    /// down, and — only if the whole staged response was consumed — writes the
+    /// final byte to `SWDATABE` so HW emits the SDR end-of-data marker.
+    ///
+    /// `last` is the value returned by [`Self::prearm_read`]. Treats an early
+    /// controller `Terminated` as success, mirroring
+    /// [`Self::dma_respond_to_read_with_ibi`].
+    pub async fn complete_prearmed_read(&mut self, last: u8) -> Result<(), IOError> {
+        let regs_ptr = self.info.regs();
+        let _drop = OnDrop::new(|| {
+            regs_ptr.sdmactrl().modify(|w| w.set_dmatb(SdmactrlDmatb::NotUsed));
+        });
+
+        // Whether the full staged response drained (DMA exhausted) vs. the
+        // controller terminated the read early with bytes still queued.
+        let mut fully_drained = true;
+
+        if self.info.regs().sdmactrl().read().dmatb() == SdmactrlDmatb::Enable {
+            fully_drained = poll_fn(|cx| {
+                let _ = self.tx_dma.wait_cell().poll_wait(cx);
+                // Re-arm errwarn so an early controller RDTERM/Stop (which
+                // leaves DMA with bytes still queued) wakes us instead of
+                // hanging forever on a DMA completion that will never come.
+                self.info.regs().sintset().write(|w| w.set_errwarn(true));
+                if self.tx_dma.is_done() {
+                    Poll::Ready(true)
+                } else if self.info.regs().sstatus().read().errwarn() {
+                    Poll::Ready(false)
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+
+            cortex_m::asm::dsb();
+
+            self.info
+                .regs()
+                .sdmactrl()
+                .modify(|w| w.set_dmatb(SdmactrlDmatb::NotUsed));
+            unsafe {
+                self.tx_dma.disable_request();
+                self.tx_dma.clear_done();
+            }
+        }
+
+        // Emit the end-of-data marker only when the controller consumed the
+        // entire staged response. On an early RDTERM the read already
+        // terminated on the wire; the FIFO is about to be flushed at Stop, so
+        // pushing another byte would be pointless (and would race the flush).
+        if fully_drained && self.wait_tx_space().await.is_ok() {
+            self.info.regs().swdatabe().write(|w| w.set_data(last));
+        }
+
+        _drop.defuse();
+
+        match self.check_status() {
+            Ok(()) | Err(IOError::Terminated) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Discard a read response staged by [`Self::prearm_read`] that the
+    /// controller never claimed (it issued a write, or another CCC, instead
+    /// of the anticipated read). Disables the TX DMA request and flushes the
+    /// pre-loaded bytes out of the TX FIFO so they can't corrupt a later read.
+    pub fn abort_prearm(&mut self) {
+        self.tx_teardown();
+    }
+
+    /// Tear down the slave TX DMA path and empty the TX FIFO. Shared by
+    /// [`Self::prearm_read`] (before staging a fresh response) and
+    /// [`Self::abort_prearm`] (discarding an unclaimed one).
+    fn tx_teardown(&mut self) {
+        unsafe {
+            self.tx_dma.disable_request();
+            self.tx_dma.clear_done();
+        }
+        self.info
+            .regs()
+            .sdmactrl()
+            .modify(|w| w.set_dmatb(SdmactrlDmatb::NotUsed));
+        // Flush TX only — RX/BBQ bytes committed during a prior write phase
+        // must survive (they're reported via `RxPending`).
+        self.info.regs().sdatactrl().modify(|w| w.set_flushtb(true));
+    }
+
     /// Diagnostic: measure the TX FIFO depth by pushing bytes until full.
     ///
     /// Flushes the TX FIFO, then writes 0x00 bytes via `SWDATAB` one at a
